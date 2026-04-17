@@ -9,6 +9,10 @@ import re
 # --- Universal Configuration ---
 SECTOR_SIZE = 512 
 CHUNK_SIZE = 8 * 1024 * 1024  
+SCAN_OVERLAP = 256 * 1024
+FRAGMENT_BLOCK_SIZE = 256 * 1024
+FRAGMENT_SEARCH_WINDOW = 256 * 1024 * 1024
+MAX_STITCH_BLOCKS = 1024
 
 CONFIG = {
     'JPG': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'max': 30*1024*1024, 'greedy': False},
@@ -26,6 +30,7 @@ class UniversalRecoveryApp:
         self.stop_event = threading.Event()
         self.files_found = 0
         self.check_vars = {}
+        self.aggressive_var = tk.BooleanVar(value=True)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -49,6 +54,7 @@ class UniversalRecoveryApp:
             var = tk.BooleanVar(value=True)
             self.check_vars[ftype] = var
             ttk.Checkbutton(filter_frame, text=ftype, variable=var).pack(side="left", padx=15)
+        ttk.Checkbutton(filter_frame, text="Aggressive fragmented mode", variable=self.aggressive_var).pack(side="left", padx=15)
 
         # --- Destination ---
         dst_frame = ttk.LabelFrame(main, text=" 3. Save Destination ", padding=10)
@@ -114,6 +120,7 @@ class UniversalRecoveryApp:
     def scan(self, src, dst, active_types):
         self.log(f"Initializing Universal Scan on: {src}")
         is_physical = src.startswith("\\\\.\\")
+        processed_offsets = set()
         
         try:
             # Handle drive size detection
@@ -121,7 +128,8 @@ class UniversalRecoveryApp:
             if not is_physical:
                 total_size = os.path.getsize(src)
             
-            pattern = b'|'.join([re.escape(CONFIG[t]['header']) for t in active_types])
+            header_map = {CONFIG[t]['header']: t for t in active_types}
+            pattern = re.compile(b'|'.join([re.escape(h) for h in header_map.keys()]))
 
             with open(src, "rb") as f:
                 off = 0
@@ -135,17 +143,17 @@ class UniversalRecoveryApp:
 
                     if total_size: self.pbar['value'] = (current_seek / total_size) * 100
                     
-                    match = re.search(pattern, chunk)
-                    if match:
+                    for match in pattern.finditer(chunk):
                         found_idx = match.start()
                         header = match.group()
-                        ftype = next(t for t in active_types if CONFIG[t]['header'] == header)
-                        
+                        ftype = header_map.get(header)
                         abs_start = current_seek + found_idx
-                        self.extract(src, abs_start, ftype, dst, active_types, is_physical)
-                        off = abs_start + (SECTOR_SIZE if is_physical else 1)
-                    else:
-                        off = current_seek + CHUNK_SIZE - 8192 # Large overlap for safety
+                        if not ftype or abs_start in processed_offsets:
+                            continue
+                        processed_offsets.add(abs_start)
+                        self.extract(src, abs_start, ftype, dst, active_types, is_physical, self.aggressive_var.get())
+
+                    off = current_seek + CHUNK_SIZE - SCAN_OVERLAP
 
         except Exception as e:
             self.log(f"Error: {e}")
@@ -155,7 +163,51 @@ class UniversalRecoveryApp:
             self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
             self.log("Scan Finished.")
 
-    def extract(self, src, start, ftype, dst, active_types, is_physical):
+    def _block_looks_like_fragment(self, block, ftype):
+        if not block:
+            return False
+        if ftype == "JPG":
+            marker_count = block.count(b"\xFF")
+            return marker_count > 100 and (block.count(b"\x00") / max(len(block), 1)) < 0.5
+        if ftype == "PNG":
+            known_chunks = [b'IHDR', b'IDAT', b'PLTE', b'IEND', b'tEXt', b'zTXt', b'iTXt']
+            return any(chunk in block for chunk in known_chunks)
+        if ftype == "PDF":
+            return any(tok in block for tok in [b' obj', b'endobj', b'stream', b'xref', b'trailer'])
+        return True
+
+    def _stitch_fragmented(self, fin, fout, cfg, ftype, rec_len):
+        footer = cfg['footer']
+        stitched = 0
+        scanned = 0
+        blocks = 0
+        while scanned < FRAGMENT_SEARCH_WINDOW and blocks < MAX_STITCH_BLOCKS and rec_len < cfg['max'] and not self.stop_event.is_set():
+            block = fin.read(FRAGMENT_BLOCK_SIZE)
+            if not block:
+                break
+            scanned += len(block)
+            blocks += 1
+            if not self._block_looks_like_fragment(block, ftype):
+                continue
+            if footer:
+                fpos = block.find(footer)
+                if fpos != -1:
+                    cut = fpos + len(footer)
+                    to_write = block[:cut]
+                    to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                    fout.write(to_write)
+                    rec_len += len(to_write)
+                    stitched += len(to_write)
+                    return rec_len, stitched, True
+            to_write = block[:max(0, cfg['max'] - rec_len)]
+            if not to_write:
+                break
+            fout.write(to_write)
+            rec_len += len(to_write)
+            stitched += len(to_write)
+        return rec_len, stitched, False
+
+    def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive):
         try:
             cfg = CONFIG[ftype]
             out_path = os.path.join(dst, ftype)
@@ -175,6 +227,11 @@ class UniversalRecoveryApp:
                 rec_len = 0
                 io_size = 512 * 1024 # 512KB for better throughput
                 first = True
+                found_end = False
+                lb_size = max(len(cfg['footer']) - 1, 32) if cfg['footer'] else 32
+                lookbehind = b''
+                active_headers = [CONFIG[t]['header'] for t in active_types]
+                header_pattern = re.compile(b'|'.join([re.escape(h) for h in active_headers]))
                 
                 while rec_len < cfg['max'] and not self.stop_event.is_set():
                     buf = fin.read(io_size)
@@ -182,30 +239,57 @@ class UniversalRecoveryApp:
                     if first:
                         buf = buf[skip:]
                         first = False
+                        if not buf:
+                            continue
 
-                    # Footer logic for JPG/PNG/PDF
+                    data = lookbehind + buf
+
+                    # Footer logic (boundary-safe) for JPG/PNG/PDF
                     if cfg['footer']:
-                        fpos = buf.find(cfg['footer'])
-                        if fpos != -1:
-                            if (rec_len + fpos) > 150 * 1024 or ftype != 'JPG':
-                                cut = fpos + len(cfg['footer'])
-                                fout.write(buf[:cut])
-                                rec_len += cut
-                                break
+                        fpos = data.find(cfg['footer'])
+                        if fpos != -1 and ((rec_len + fpos) > 150 * 1024 or ftype != 'JPG'):
+                            cut = fpos + len(cfg['footer'])
+                            to_write = data[:cut]
+                            to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                            fout.write(to_write)
+                            rec_len += len(to_write)
+                            found_end = True
+                            break
 
-                    # Greedy logic for MP4/ZIP
+                    # Greedy logic for MP4/ZIP (also boundary-safe)
                     if cfg['greedy'] and rec_len > 1024 * 1024:
-                        next_h = False
-                        for t in active_types:
-                            if CONFIG[t]['header'] in buf:
-                                h_pos = buf.find(CONFIG[t]['header'])
-                                fout.write(buf[:h_pos])
-                                rec_len += h_pos
-                                next_h = True; break
-                        if next_h: break
+                        h_match = header_pattern.search(data)
+                        if h_match and h_match.start() > 0:
+                            h_pos = h_match.start()
+                            to_write = data[:h_pos]
+                            to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                            fout.write(to_write)
+                            rec_len += len(to_write)
+                            found_end = True
+                            break
 
-                    fout.write(buf)
-                    rec_len += len(buf)
+                    if len(data) > lb_size:
+                        flush_len = len(data) - lb_size
+                        to_write = data[:flush_len]
+                        to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                        if to_write:
+                            fout.write(to_write)
+                            rec_len += len(to_write)
+                        lookbehind = data[flush_len:]
+                    else:
+                        lookbehind = data
+
+                if lookbehind and rec_len < cfg['max'] and not found_end:
+                    to_write = lookbehind[:max(0, cfg['max'] - rec_len)]
+                    if to_write:
+                        fout.write(to_write)
+                        rec_len += len(to_write)
+
+                stitched = 0
+                if aggressive and cfg['footer'] and not found_end and rec_len < cfg['max']:
+                    rec_len, stitched, found_end = self._stitch_fragmented(fin, fout, cfg, ftype, rec_len)
+                    if stitched > 0:
+                        self.log(f"Fragment stitch applied on {ftype} @ {hex(start)} (+{stitched // 1024} KB).")
 
             if rec_len > 0:
                 self.files_found += 1
