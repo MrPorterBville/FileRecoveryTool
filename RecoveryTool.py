@@ -36,7 +36,7 @@ class UniversalRecoveryApp:
         self.stop_event = threading.Event()
         self.files_found = 0
         self.check_vars = {}
-        self.aggressive_var = tk.BooleanVar(value=True)
+        self.aggressive_var = tk.BooleanVar(value=False)
         self.unallocated_only_var = tk.BooleanVar(value=False)
         self._setup_ui()
 
@@ -478,8 +478,15 @@ class UniversalRecoveryApp:
                 jpg_min_end_offset = JPG_MIN_END_OFFSET_BYTES if skip_thumbnails else 150 * 1024
                 lb_size = max(len(cfg['footer']) - 1, 32) if cfg['footer'] else 32
                 lookbehind = b''
-                active_headers = [CONFIG[t]['header'] for t in active_types]
-                header_pattern = re.compile(b'|'.join([re.escape(h) for h in active_headers]))
+                # For greedy formats (MP4/ZIP), very short signatures such as JPG's
+                # 3-byte marker create many false-positive boundaries and can truncate
+                # otherwise healthy recoveries. Use only stronger, cross-type markers.
+                greedy_headers = [
+                    CONFIG[t]['header']
+                    for t in active_types
+                    if t != ftype and len(CONFIG[t]['header']) >= 4
+                ]
+                header_pattern = re.compile(b'|'.join([re.escape(h) for h in greedy_headers])) if greedy_headers else None
                 
                 while rec_len < cfg['max'] and not self.stop_event.is_set():
                     buf = fin.read(io_size)
@@ -505,7 +512,7 @@ class UniversalRecoveryApp:
                             break
 
                     # Greedy logic for MP4/ZIP (also boundary-safe)
-                    if cfg['greedy'] and rec_len > 1024 * 1024:
+                    if cfg['greedy'] and rec_len > 1024 * 1024 and header_pattern is not None:
                         h_match = header_pattern.search(data)
                         if h_match and h_match.start() > 0:
                             h_pos = h_match.start()
@@ -548,12 +555,19 @@ class UniversalRecoveryApp:
                         pass
                     return
 
-                if not self._is_file_viable(filename, ftype):
+                is_viable = self._is_file_viable(filename, ftype)
+                if not is_viable:
                     self.log(f"Recovered {ftype} @ {hex(start)} failed viability check. Attempting repair...")
                     if self._attempt_file_repair(filename, ftype):
                         self.log(f"Repair successful for {ftype} @ {hex(start)}.")
+                        is_viable = True
                     else:
-                        self.log(f"Repair failed for {ftype} @ {hex(start)}. File kept for manual analysis.")
+                        self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
+                        try:
+                            os.remove(filename)
+                        except OSError:
+                            pass
+                        return
 
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
