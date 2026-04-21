@@ -7,6 +7,8 @@ import time
 import re
 import bisect
 import ctypes
+import json
+import zlib
 from ctypes import wintypes
 import zipfile
 
@@ -17,6 +19,11 @@ SCAN_OVERLAP = 256 * 1024
 FRAGMENT_BLOCK_SIZE = 256 * 1024
 FRAGMENT_SEARCH_WINDOW = 256 * 1024 * 1024
 MAX_STITCH_BLOCKS = 1024
+FRAGMENT_SCAN_STEP = 64 * 1024
+MAX_FRAGMENT_CANDIDATES = 24
+FRAGMENT_SCORE_THRESHOLD = 0.45
+FRAGMENT_BEAM_WIDTH = 6
+MAX_FRAGMENT_PATH_DEPTH = 10
 THUMBNAIL_CUTOFF_BYTES = 200 * 1024
 JPG_MIN_END_OFFSET_BYTES = 512 * 1024
 
@@ -35,6 +42,8 @@ class UniversalRecoveryApp:
         self.root.geometry("1100x850")
         self.stop_event = threading.Event()
         self.files_found = 0
+        self.recovery_report = []
+        self.report_lock = threading.Lock()
         self.check_vars = {}
         self.aggressive_var = tk.BooleanVar(value=False)
         self.unallocated_only_var = tk.BooleanVar(value=False)
@@ -131,8 +140,13 @@ class UniversalRecoveryApp:
         processed_offsets = set()
         alloc_filter = None
         skip_thumbnails = True
+        self.recovery_report = []
         
         try:
+            self.log("Pass 1/4: metadata discovery (best effort).")
+            metadata_artifacts = self._run_metadata_pass(src, is_physical)
+            self.log(f"Pass 1/4 complete. Artifacts discovered: {metadata_artifacts}.")
+
             # Handle drive size detection
             total_size = 0
             if not is_physical:
@@ -149,6 +163,7 @@ class UniversalRecoveryApp:
             pattern = re.compile(b'|'.join([re.escape(h) for h in header_map.keys()]))
 
             with open(src, "rb") as f:
+                self.log("Pass 2/4: signature carving.")
                 off = 0
                 while not self.stop_event.is_set():
                     # Align ONLY if physical
@@ -176,11 +191,16 @@ class UniversalRecoveryApp:
                         )
 
                     off = current_seek + CHUNK_SIZE - SCAN_OVERLAP
+                self.log("Pass 2/4 complete.")
+
+            self.log("Pass 3/4: fragmented reassembly is applied opportunistically per-file when aggressive mode is enabled.")
+            self.log("Pass 4/4: format validation and repair is applied per recovered file.")
 
         except Exception as e:
             self.log(f"Error: {e}")
             if "PermissionError" in str(e): self.log("!!! RUN AS ADMINISTRATOR !!!")
         finally:
+            self._flush_recovery_report(dst)
             self.root.after(0, lambda: self.btn_go.config(state="normal"))
             self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
             self.log("Scan Finished.")
@@ -189,6 +209,41 @@ class UniversalRecoveryApp:
         starts, ends = alloc_filter
         idx = bisect.bisect_right(starts, offset) - 1
         return idx >= 0 and offset < ends[idx]
+
+    def _run_metadata_pass(self, src, is_physical):
+        # Best-effort lightweight metadata signal discovery.
+        # This is intentionally conservative to avoid heavy memory use on large sources.
+        signatures = [b"FILE0", b"INDX", b"$MFT", b"NTFS", b"APFS", b"EXT4", b"exFAT"]
+        discovered = 0
+        try:
+            with open(src, "rb") as f:
+                buf = f.read(8 * 1024 * 1024)
+            for sig in signatures:
+                if sig in buf:
+                    discovered += 1
+            if discovered and is_physical:
+                self.log("Metadata hints detected; future versions should parse full filesystem structures.")
+        except Exception as e:
+            self.log(f"Metadata pass warning: {e}")
+        return discovered
+
+    def _flush_recovery_report(self, dst):
+        try:
+            if not dst:
+                return
+            with self.report_lock:
+                payload = {
+                    "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "total_recovered": len(self.recovery_report),
+                    "files": self.recovery_report,
+                }
+            os.makedirs(dst, exist_ok=True)
+            out = os.path.join(dst, "recovery_report.json")
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            self.log(f"Forensic report written: {out}")
+        except Exception as e:
+            self.log(f"Failed writing forensic report: {e}")
 
     def _build_allocation_filter(self, src, is_physical):
         if sys.platform != "win32":
@@ -337,19 +392,121 @@ class UniversalRecoveryApp:
             return any(tok in block for tok in [b' obj', b'endobj', b'stream', b'xref', b'trailer'])
         return True
 
-    def _stitch_fragmented(self, fin, fout, cfg, ftype, rec_len):
-        footer = cfg['footer']
-        stitched = 0
-        scanned = 0
-        blocks = 0
-        while scanned < FRAGMENT_SEARCH_WINDOW and blocks < MAX_STITCH_BLOCKS and rec_len < cfg['max'] and not self.stop_event.is_set():
+    def _score_fragment_candidate(self, prev_tail, block, ftype):
+        if not block:
+            return 0.0
+
+        score = 0.0
+        if prev_tail:
+            overlap = min(len(prev_tail), 32)
+            if overlap > 0:
+                tail = prev_tail[-overlap:]
+                head = block[:overlap]
+                continuity = sum(1 for a, b in zip(tail, head) if abs(a - b) <= 8) / overlap
+                score += continuity * 0.35
+
+        if ftype == "JPG":
+            marker_density = min(1.0, block.count(b"\xFF") / max(len(block) / 48.0, 1.0))
+            has_segments = (b"\xFF\xDB" in block) or (b"\xFF\xC0" in block) or (b"\xFF\xDA" in block)
+            score += 0.30 * marker_density
+            score += 0.25 if has_segments else 0.0
+        elif ftype == "PNG":
+            chunk_hits = sum(1 for c in [b'IDAT', b'IHDR', b'PLTE', b'tEXt', b'zTXt', b'iTXt'] if c in block)
+            score += min(0.55, chunk_hits * 0.16)
+        elif ftype == "PDF":
+            tok_hits = sum(1 for t in [b' obj', b'endobj', b'stream', b'xref', b'trailer'] if t in block)
+            score += min(0.55, tok_hits * 0.14)
+        else:
+            score += 0.25
+
+        if cfg := CONFIG.get(ftype):
+            footer = cfg.get("footer")
+            if footer and footer in block:
+                score += 0.35
+
+        return min(1.0, score)
+
+    def _scan_fragment_candidates(self, fin, ftype, window_start, window_end, prev_tail, used_positions):
+        candidates = []
+        pos = window_start
+        while pos < window_end and not self.stop_event.is_set():
+            if pos in used_positions:
+                pos += FRAGMENT_SCAN_STEP
+                continue
+            fin.seek(pos)
             block = fin.read(FRAGMENT_BLOCK_SIZE)
             if not block:
                 break
-            scanned += len(block)
-            blocks += 1
             if not self._block_looks_like_fragment(block, ftype):
+                pos += FRAGMENT_SCAN_STEP
                 continue
+            score = self._score_fragment_candidate(prev_tail, block, ftype)
+            if score >= FRAGMENT_SCORE_THRESHOLD:
+                candidates.append((score, pos, block))
+            pos += FRAGMENT_SCAN_STEP
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[:MAX_FRAGMENT_CANDIDATES]
+
+    def _pair_fragment_score(self, left_block, right_block):
+        overlap = min(32, len(left_block), len(right_block))
+        if overlap <= 0:
+            return 0.0
+        left_tail = left_block[-overlap:]
+        right_head = right_block[:overlap]
+        return sum(1 for a, b in zip(left_tail, right_head) if abs(a - b) <= 8) / overlap
+
+    def _select_fragment_path(self, candidates):
+        # candidates: [(score, pos, block), ...]
+        if not candidates:
+            return []
+        beams = []
+        for idx, (base_score, pos, block) in enumerate(candidates):
+            beams.append((base_score, [idx], block))
+
+        for _ in range(MAX_FRAGMENT_PATH_DEPTH - 1):
+            next_beams = []
+            for score, path, last_block in beams:
+                used = set(path)
+                for idx, (node_score, _, node_block) in enumerate(candidates):
+                    if idx in used:
+                        continue
+                    edge = self._pair_fragment_score(last_block, node_block)
+                    total = score + (node_score * 0.8) + (edge * 0.6)
+                    next_beams.append((total, path + [idx], node_block))
+            if not next_beams:
+                break
+            next_beams.sort(key=lambda x: x[0], reverse=True)
+            beams = next_beams[:FRAGMENT_BEAM_WIDTH]
+
+        best = max(beams, key=lambda x: x[0], default=None)
+        if not best:
+            return []
+        return [candidates[i] for i in best[1]]
+
+    def _stitch_fragmented(self, fin, fout, cfg, ftype, rec_len, prev_tail=b''):
+        footer = cfg['footer']
+        stitched = 0
+        blocks = 0
+        trace = []
+        used_positions = set()
+        initial_pos = fin.tell()
+        scan_limit = initial_pos + FRAGMENT_SEARCH_WINDOW
+        last_tail = prev_tail[-64:] if prev_tail else b''
+
+        candidates = self._scan_fragment_candidates(fin, ftype, initial_pos, scan_limit, last_tail, used_positions)
+        path = self._select_fragment_path(candidates)
+        if not path:
+            return rec_len, stitched, False, trace, 0.0
+
+        avg_score = 0.0
+        for score, block_pos, block in path:
+            if blocks >= MAX_STITCH_BLOCKS or rec_len >= cfg['max'] or self.stop_event.is_set():
+                break
+            blocks += 1
+            used_positions.add(block_pos)
+            avg_score += score
+
             if footer:
                 fpos = block.find(footer)
                 if fpos != -1:
@@ -359,14 +516,69 @@ class UniversalRecoveryApp:
                     fout.write(to_write)
                     rec_len += len(to_write)
                     stitched += len(to_write)
-                    return rec_len, stitched, True
+                    trace.append({"offset": block_pos, "score": round(score, 4), "bytes_written": len(to_write), "footer_found": True})
+                    if to_write:
+                        last_tail = (last_tail + to_write)[-64:]
+                    self.log(f"Fragment candidate score {score:.2f} selected at {hex(block_pos)} (footer found).")
+                    conf = min(1.0, avg_score / max(1, blocks))
+                    return rec_len, stitched, True, trace, conf
+
             to_write = block[:max(0, cfg['max'] - rec_len)]
             if not to_write:
                 break
             fout.write(to_write)
             rec_len += len(to_write)
             stitched += len(to_write)
-        return rec_len, stitched, False
+            last_tail = (last_tail + to_write)[-64:]
+            trace.append({"offset": block_pos, "score": round(score, 4), "bytes_written": len(to_write), "footer_found": False})
+            self.log(f"Fragment candidate score {score:.2f} selected at {hex(block_pos)}.")
+
+        conf = min(1.0, avg_score / max(1, blocks))
+        return rec_len, stitched, False, trace, conf
+
+    def _validate_jpeg(self, data):
+        if not (data.startswith(b"\xFF\xD8") and data.endswith(b"\xFF\xD9")):
+            return False
+        return (b"\xFF\xDB" in data) or (b"\xFF\xC0" in data) or (b"\xFF\xC2" in data)
+
+    def _validate_png(self, data):
+        if not data.startswith(CONFIG["PNG"]["header"]):
+            return False
+        pos = 8
+        saw_ihdr = False
+        saw_idat = False
+        saw_iend = False
+        while pos + 12 <= len(data):
+            length = int.from_bytes(data[pos:pos + 4], "big")
+            ctype = data[pos + 4:pos + 8]
+            end = pos + 12 + length
+            if end > len(data):
+                return False
+            chunk = data[pos + 8:pos + 8 + length]
+            crc = int.from_bytes(data[pos + 8 + length:pos + 12 + length], "big")
+            calc = zlib.crc32(ctype)
+            calc = zlib.crc32(chunk, calc) & 0xFFFFFFFF
+            if crc != calc:
+                return False
+            if ctype == b"IHDR":
+                saw_ihdr = True
+            elif ctype == b"IDAT":
+                saw_idat = True
+            elif ctype == b"IEND":
+                saw_iend = True
+                break
+            pos = end
+        return saw_ihdr and saw_idat and saw_iend
+
+    def _validate_pdf(self, data):
+        return data.startswith(b"%PDF-") and (b"%%EOF" in data[-4096:]) and (b"xref" in data or b" obj" in data)
+
+    def _validate_mp4(self, data):
+        if b"ftyp" not in data[:64]:
+            return False
+        atoms = [b"moov", b"mdat", b"trak", b"mdia"]
+        hits = sum(1 for a in atoms if a in data)
+        return hits >= 2
 
     def _is_file_viable(self, path, ftype):
         try:
@@ -376,16 +588,16 @@ class UniversalRecoveryApp:
                 return False
 
             if ftype == "JPG":
-                return data.startswith(b"\xFF\xD8") and data.endswith(b"\xFF\xD9")
+                return self._validate_jpeg(data)
             if ftype == "PNG":
-                return data.startswith(CONFIG["PNG"]["header"]) and data.endswith(CONFIG["PNG"]["footer"]) and b"IHDR" in data and b"IDAT" in data
+                return self._validate_png(data)
             if ftype == "PDF":
-                return data.startswith(b"%PDF-") and b"%%EOF" in data[-2048:]
+                return self._validate_pdf(data)
             if ftype == "ZIP":
                 with zipfile.ZipFile(path, "r") as zf:
                     return zf.testzip() is None
             if ftype == "MP4":
-                return (b"ftyp" in data[:64]) and (b"moov" in data or b"mdat" in data)
+                return self._validate_mp4(data)
             return True
         except Exception:
             return False
@@ -460,6 +672,10 @@ class UniversalRecoveryApp:
             out_path = os.path.join(dst, ftype)
             os.makedirs(out_path, exist_ok=True)
             filename = os.path.join(out_path, f"recovered_{start}.{ftype.lower()}")
+            stitched = 0
+            stitch_trace = []
+            stitch_confidence = 0.0
+            repaired = False
             
             with open(src, "rb") as fin, open(filename, "wb") as fout:
                 # Seek logic for mixed sources
@@ -540,9 +756,8 @@ class UniversalRecoveryApp:
                         fout.write(to_write)
                         rec_len += len(to_write)
 
-                stitched = 0
                 if aggressive and cfg['footer'] and not found_end and rec_len < cfg['max']:
-                    rec_len, stitched, found_end = self._stitch_fragmented(fin, fout, cfg, ftype, rec_len)
+                    rec_len, stitched, found_end, stitch_trace, stitch_confidence = self._stitch_fragmented(fin, fout, cfg, ftype, rec_len, lookbehind)
                     if stitched > 0:
                         self.log(f"Fragment stitch applied on {ftype} @ {hex(start)} (+{stitched // 1024} KB).")
 
@@ -561,6 +776,7 @@ class UniversalRecoveryApp:
                     if self._attempt_file_repair(filename, ftype):
                         self.log(f"Repair successful for {ftype} @ {hex(start)}.")
                         is_viable = True
+                        repaired = True
                     else:
                         self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
                         try:
@@ -572,7 +788,23 @@ class UniversalRecoveryApp:
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
                 self.root.after(0, lambda: self.tree.insert("", 0, values=(self.files_found, ftype, sz, hex(start))))
-        except: pass
+                confidence = min(1.0, 0.55 + (0.25 if is_viable else 0.0) + min(0.20, stitch_confidence * 0.20))
+                with self.report_lock:
+                    self.recovery_report.append({
+                        "id": self.files_found,
+                        "type": ftype,
+                        "source_offset": start,
+                        "output_path": filename,
+                        "bytes_recovered": rec_len,
+                        "aggressive_mode": aggressive,
+                        "fragment_stitch_bytes": stitched,
+                        "fragment_trace": stitch_trace,
+                        "validator_passed": is_viable,
+                        "repair_applied": repaired,
+                        "confidence": round(confidence, 4),
+                    })
+        except Exception as e:
+            self.log(f"Extraction failure for {ftype} @ {hex(start)}: {e}")
 
 if __name__ == "__main__":
     root = tk.Tk()
