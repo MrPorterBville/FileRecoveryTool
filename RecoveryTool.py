@@ -16,6 +16,8 @@ SCAN_OVERLAP = 256 * 1024
 FRAGMENT_BLOCK_SIZE = 256 * 1024
 FRAGMENT_SEARCH_WINDOW = 256 * 1024 * 1024
 MAX_STITCH_BLOCKS = 1024
+THUMBNAIL_CUTOFF_BYTES = 200 * 1024
+JPG_MIN_END_OFFSET_BYTES = 512 * 1024
 
 CONFIG = {
     'JPG': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'max': 30*1024*1024, 'greedy': False},
@@ -166,7 +168,10 @@ class UniversalRecoveryApp:
                         if alloc_filter and self._offset_is_allocated(abs_start, alloc_filter):
                             continue
                         processed_offsets.add(abs_start)
-                        self.extract(src, abs_start, ftype, dst, active_types, is_physical, self.aggressive_var.get())
+                        self.extract(
+                            src, abs_start, ftype, dst, active_types, is_physical,
+                            self.aggressive_var.get(), skip_thumbnails
+                        )
 
                     off = current_seek + CHUNK_SIZE - SCAN_OVERLAP
 
@@ -361,7 +366,7 @@ class UniversalRecoveryApp:
             stitched += len(to_write)
         return rec_len, stitched, False
 
-    def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive):
+    def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive, skip_thumbnails):
         try:
             cfg = CONFIG[ftype]
             out_path = os.path.join(dst, ftype)
@@ -382,6 +387,7 @@ class UniversalRecoveryApp:
                 io_size = 512 * 1024 # 512KB for better throughput
                 first = True
                 found_end = False
+                jpg_min_end_offset = JPG_MIN_END_OFFSET_BYTES if skip_thumbnails else 150 * 1024
                 lb_size = max(len(cfg['footer']) - 1, 32) if cfg['footer'] else 32
                 lookbehind = b''
                 active_headers = [CONFIG[t]['header'] for t in active_types]
@@ -401,7 +407,7 @@ class UniversalRecoveryApp:
                     # Footer logic (boundary-safe) for JPG/PNG/PDF
                     if cfg['footer']:
                         fpos = data.find(cfg['footer'])
-                        if fpos != -1 and ((rec_len + fpos) > 150 * 1024 or ftype != 'JPG'):
+                        if fpos != -1 and ((rec_len + fpos) > jpg_min_end_offset or ftype != 'JPG'):
                             cut = fpos + len(cfg['footer'])
                             to_write = data[:cut]
                             to_write = to_write[:max(0, cfg['max'] - rec_len)]
@@ -446,6 +452,13 @@ class UniversalRecoveryApp:
                         self.log(f"Fragment stitch applied on {ftype} @ {hex(start)} (+{stitched // 1024} KB).")
 
             if rec_len > 0:
+                if skip_thumbnails and ftype in ("JPG", "PNG") and rec_len < THUMBNAIL_CUTOFF_BYTES:
+                    try:
+                        os.remove(filename)
+                        self.log(f"Skipped likely thumbnail {ftype} @ {hex(start)} ({rec_len // 1024} KB).")
+                    except OSError:
+                        pass
+                    return
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
                 self.root.after(0, lambda: self.tree.insert("", 0, values=(self.files_found, ftype, sz, hex(start))))
