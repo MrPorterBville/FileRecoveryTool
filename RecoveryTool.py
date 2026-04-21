@@ -37,7 +37,6 @@ class UniversalRecoveryApp:
         self.check_vars = {}
         self.aggressive_var = tk.BooleanVar(value=True)
         self.unallocated_only_var = tk.BooleanVar(value=False)
-        self.skip_thumbnails_var = tk.BooleanVar(value=True)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -63,7 +62,6 @@ class UniversalRecoveryApp:
             ttk.Checkbutton(filter_frame, text=ftype, variable=var).pack(side="left", padx=15)
         ttk.Checkbutton(filter_frame, text="Aggressive fragmented mode", variable=self.aggressive_var).pack(side="left", padx=15)
         ttk.Checkbutton(filter_frame, text="Recover from unallocated space only (Windows NTFS, best-effort)", variable=self.unallocated_only_var).pack(side="left", padx=15)
-        ttk.Checkbutton(filter_frame, text="Ignore likely thumbnails (JPG/PNG under 200KB)", variable=self.skip_thumbnails_var).pack(side="left", padx=15)
 
         # --- Destination ---
         dst_frame = ttk.LabelFrame(main, text=" 3. Save Destination ", padding=10)
@@ -124,13 +122,9 @@ class UniversalRecoveryApp:
         self.btn_go.config(state="disabled"); self.btn_stop.config(state="normal")
         self.files_found = 0
         self.tree.delete(*self.tree.get_children())
-        threading.Thread(
-            target=self.scan,
-            args=(src, dst, active, self.unallocated_only_var.get(), self.skip_thumbnails_var.get()),
-            daemon=True
-        ).start()
+        threading.Thread(target=self.scan, args=(src, dst, active, self.unallocated_only_var.get()), daemon=True).start()
 
-    def scan(self, src, dst, active_types, unallocated_only=False, skip_thumbnails=True):
+    def scan(self, src, dst, active_types, unallocated_only=False):
         self.log(f"Initializing Universal Scan on: {src}")
         is_physical = src.startswith("\\\\.\\")
         processed_offsets = set()
