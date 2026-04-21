@@ -8,6 +8,7 @@ import re
 import bisect
 import ctypes
 from ctypes import wintypes
+import zipfile
 
 # --- Universal Configuration ---
 SECTOR_SIZE = 512 
@@ -129,6 +130,7 @@ class UniversalRecoveryApp:
         is_physical = src.startswith("\\\\.\\")
         processed_offsets = set()
         alloc_filter = None
+        skip_thumbnails = True
         
         try:
             # Handle drive size detection
@@ -366,6 +368,92 @@ class UniversalRecoveryApp:
             stitched += len(to_write)
         return rec_len, stitched, False
 
+    def _is_file_viable(self, path, ftype):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                return False
+
+            if ftype == "JPG":
+                return data.startswith(b"\xFF\xD8") and data.endswith(b"\xFF\xD9")
+            if ftype == "PNG":
+                return data.startswith(CONFIG["PNG"]["header"]) and data.endswith(CONFIG["PNG"]["footer"]) and b"IHDR" in data and b"IDAT" in data
+            if ftype == "PDF":
+                return data.startswith(b"%PDF-") and b"%%EOF" in data[-2048:]
+            if ftype == "ZIP":
+                with zipfile.ZipFile(path, "r") as zf:
+                    return zf.testzip() is None
+            if ftype == "MP4":
+                return (b"ftyp" in data[:64]) and (b"moov" in data or b"mdat" in data)
+            return True
+        except Exception:
+            return False
+
+    def _attempt_file_repair(self, path, ftype):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                return False
+
+            repaired = data
+
+            if ftype == "JPG":
+                soi = repaired.find(b"\xFF\xD8")
+                eoi = repaired.rfind(b"\xFF\xD9")
+                if soi != -1 and eoi != -1 and eoi > soi:
+                    repaired = repaired[soi:eoi + 2]
+                elif soi != -1 and eoi == -1:
+                    repaired = repaired[soi:] + b"\xFF\xD9"
+                else:
+                    return False
+            elif ftype == "PNG":
+                sig = CONFIG["PNG"]["header"]
+                iend = CONFIG["PNG"]["footer"]
+                sig_pos = repaired.find(sig)
+                iend_pos = repaired.rfind(iend)
+                if sig_pos == -1:
+                    return False
+                repaired = repaired[sig_pos:]
+                if iend_pos != -1 and iend_pos >= sig_pos:
+                    rel_iend = iend_pos - sig_pos
+                    repaired = repaired[:rel_iend + len(iend)]
+                elif not repaired.endswith(iend):
+                    repaired += iend
+            elif ftype == "PDF":
+                pdf_pos = repaired.find(b"%PDF-")
+                if pdf_pos == -1:
+                    return False
+                repaired = repaired[pdf_pos:]
+                if b"%%EOF" not in repaired[-2048:]:
+                    repaired += b"\n%%EOF\n"
+            elif ftype == "ZIP":
+                eocd = repaired.rfind(b"PK\x05\x06")
+                if eocd == -1:
+                    return False
+                if len(repaired) >= eocd + 22:
+                    comment_len = int.from_bytes(repaired[eocd + 20:eocd + 22], "little", signed=False)
+                    repaired = repaired[:eocd + 22 + comment_len]
+                else:
+                    return False
+            elif ftype == "MP4":
+                ftyp = repaired.find(b"ftyp")
+                if ftyp == -1:
+                    return False
+                repaired = repaired[max(0, ftyp - 4):]
+                if b"moov" not in repaired and b"mdat" not in repaired:
+                    return False
+            else:
+                return False
+
+            if repaired and repaired != data:
+                with open(path, "wb") as f:
+                    f.write(repaired)
+            return self._is_file_viable(path, ftype)
+        except Exception:
+            return False
+
     def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive, skip_thumbnails):
         try:
             cfg = CONFIG[ftype]
@@ -459,6 +547,14 @@ class UniversalRecoveryApp:
                     except OSError:
                         pass
                     return
+
+                if not self._is_file_viable(filename, ftype):
+                    self.log(f"Recovered {ftype} @ {hex(start)} failed viability check. Attempting repair...")
+                    if self._attempt_file_repair(filename, ftype):
+                        self.log(f"Repair successful for {ftype} @ {hex(start)}.")
+                    else:
+                        self.log(f"Repair failed for {ftype} @ {hex(start)}. File kept for manual analysis.")
+
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
                 self.root.after(0, lambda: self.tree.insert("", 0, values=(self.files_found, ftype, sz, hex(start))))
