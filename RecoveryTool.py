@@ -213,12 +213,6 @@ class UniversalRecoveryApp:
                             continue
                         if ftype == "MP4" and not self._looks_like_mp4_header_at(chunk, found_idx):
                             continue
-                        if ftype == "JPG" and self.skip_exif_thumbs_var.get() and self._in_ranges(abs_start, jpg_exclusion_ranges):
-                            self.log(f"Skipped JPG signature in EXIF thumbnail region @ {hex(abs_start)}.")
-                            continue
-                        if ftype == "JPG" and self._in_ranges(abs_start, jpg_container_ranges):
-                            self.log(f"Skipped nested JPG signature inside previously recovered JPG @ {hex(abs_start)}.")
-                            continue
                         if alloc_filter and self._offset_is_allocated(abs_start, alloc_filter):
                             continue
                         processed_offsets.add(abs_start)
