@@ -386,7 +386,8 @@ class NTFSReconstructionGUI:
         src_box.pack(fill="x", pady=6)
         self.src_entry = ttk.Entry(src_box)
         self.src_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ttk.Button(src_box, text="Browse", command=self._pick_source).pack(side="left")
+        ttk.Button(src_box, text="File/Image", command=self._pick_source).pack(side="left", padx=(0, 6))
+        ttk.Button(src_box, text="Physical Drive", command=self._pick_drive).pack(side="left")
 
         dst_box = ttk.LabelFrame(main, text="2. Output folder", padding=10)
         dst_box.pack(fill="x", pady=6)
@@ -420,6 +421,19 @@ class NTFSReconstructionGUI:
         if path:
             self.src_entry.delete(0, tk.END)
             self.src_entry.insert(0, path)
+
+    def _pick_drive(self):
+        # Use directory chooser to capture a mounted drive and convert to raw volume path on Windows.
+        drive_dir = filedialog.askdirectory(title="Select Drive (example: C:\\)")
+        if not drive_dir:
+            return
+        drive = os.path.splitdrive(drive_dir)[0]
+        if not drive:
+            messagebox.showerror("Invalid drive", "Unable to detect drive letter from selection.")
+            return
+        raw_path = f"\\\\.\\{drive}" if os.name == "nt" else drive
+        self.src_entry.delete(0, tk.END)
+        self.src_entry.insert(0, raw_path)
 
     def _pick_destination(self):
         path = filedialog.askdirectory(title="Select output folder")
