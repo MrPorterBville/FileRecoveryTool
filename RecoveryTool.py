@@ -11,6 +11,7 @@ import json
 import zlib
 import math
 import struct
+import io
 from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 import zipfile
@@ -870,7 +871,14 @@ class UniversalRecoveryApp:
                 data = f.read()
             if not data:
                 return False
+            return self._is_data_viable(ftype, data)
+        except Exception:
+            return False
 
+    def _is_data_viable(self, ftype, data):
+        try:
+            if not data:
+                return False
             if ftype == "JPG":
                 return self._validate_jpeg(data)
             if ftype == "PNG":
@@ -878,7 +886,7 @@ class UniversalRecoveryApp:
             if ftype == "PDF":
                 return self._validate_pdf(data)
             if ftype == "ZIP":
-                with zipfile.ZipFile(path, "r") as zf:
+                with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
                     return zf.testzip() is None
             if ftype == "MP4":
                 return self._validate_mp4(data)
@@ -949,8 +957,11 @@ class UniversalRecoveryApp:
                 return False
 
             if repaired and repaired != data:
+                if not self._is_data_viable(ftype, repaired):
+                    return False
                 with open(path, "wb") as f:
                     f.write(repaired)
+                return True
             return self._is_file_viable(path, ftype)
         except Exception:
             return False
