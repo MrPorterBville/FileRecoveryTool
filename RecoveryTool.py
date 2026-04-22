@@ -9,6 +9,7 @@ import bisect
 import ctypes
 import json
 import zlib
+import math
 from ctypes import wintypes
 import zipfile
 
@@ -28,6 +29,7 @@ THUMBNAIL_CUTOFF_BYTES = 200 * 1024
 JPG_MIN_END_OFFSET_BYTES = 512 * 1024
 DEFAULT_MIN_JPG_BYTES = 20 * 1024
 DEFAULT_MIN_JPG_DIMENSION = 250
+FORCE_RENDER_WIDTHS = (256, 320, 512, 640, 800, 1024, 1280, 1600, 1920)
 
 CONFIG = {
     'JPG': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'max': 30*1024*1024, 'greedy': False},
@@ -896,6 +898,59 @@ class UniversalRecoveryApp:
         except Exception:
             return False
 
+    def _force_render_jpg_preview(self, path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                return None
+
+            start = data.find(b"\xFF\xD8")
+            end = data.rfind(b"\xFF\xD9")
+            if start != -1:
+                if end != -1 and end > start:
+                    data = data[start:end + 2]
+                else:
+                    data = data[start:]
+
+            data = data.replace(b"\xFF\xD8", b"").replace(b"\xFF\xD9", b"")
+            if not data:
+                return None
+
+            arr = bytearray(data)
+            usable_len = (len(arr) // 3) * 3
+            if usable_len <= 0:
+                return None
+            arr = arr[:usable_len]
+
+            width = None
+            height = None
+            for candidate in FORCE_RENDER_WIDTHS:
+                h = usable_len // (3 * candidate)
+                if h >= 8:
+                    width = candidate
+                    height = h
+                    break
+
+            if width is None or height is None:
+                px = usable_len // 3
+                side = int(math.sqrt(px))
+                if side < 8:
+                    return None
+                width = side
+                height = side
+
+            pixels = width * height * 3
+            rgb = bytes(arr[:pixels])
+            base, _ = os.path.splitext(path)
+            ppm_path = base + "_force_preview.ppm"
+            with open(ppm_path, "wb") as out:
+                out.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
+                out.write(rgb)
+            return ppm_path
+        except Exception:
+            return None
+
     def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive, skip_thumbnails):
         try:
             cfg = CONFIG[ftype]
@@ -906,6 +961,7 @@ class UniversalRecoveryApp:
             stitch_trace = []
             stitch_confidence = 0.0
             repaired = False
+            forced_preview_path = None
             nested_jpeg_count = 0
             jpg_dimensions = (None, None)
             exif_ranges = []
@@ -1043,12 +1099,26 @@ class UniversalRecoveryApp:
                         is_viable = True
                         repaired = True
                     else:
-                        self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
-                        try:
-                            os.remove(filename)
-                        except OSError:
-                            pass
-                        return
+                        if ftype == "JPG":
+                            forced_preview_path = self._force_render_jpg_preview(filename)
+                            if forced_preview_path:
+                                self.log(f"Repair failed for JPG @ {hex(start)}. Force-render preview generated: {forced_preview_path}")
+                                repaired = True
+                                is_viable = True
+                            else:
+                                self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
+                                try:
+                                    os.remove(filename)
+                                except OSError:
+                                    pass
+                                return
+                        else:
+                            self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
+                            try:
+                                os.remove(filename)
+                            except OSError:
+                                pass
+                            return
 
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
@@ -1062,6 +1132,7 @@ class UniversalRecoveryApp:
                         "type": ftype,
                         "source_offset": start,
                         "output_path": filename,
+                        "forced_preview_path": forced_preview_path,
                         "bytes_recovered": rec_len,
                         "aggressive_mode": aggressive,
                         "fragment_stitch_bytes": stitched,
