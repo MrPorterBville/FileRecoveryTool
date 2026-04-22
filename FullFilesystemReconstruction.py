@@ -4,7 +4,10 @@ import os
 import re
 import struct
 import time
+import threading
+import tkinter as tk
 from dataclasses import dataclass, field
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Dict, List, Optional, Tuple
 
 
@@ -80,10 +83,19 @@ class MFTEntry:
 
 
 class NTFSReconstructor:
-    def __init__(self, image_path: str, out_dir: str, max_records: int = 250000):
+    def __init__(
+        self,
+        image_path: str,
+        out_dir: str,
+        max_records: int = 250000,
+        recover_deleted_only: bool = True,
+        logger=None,
+    ):
         self.image_path = image_path
         self.out_dir = out_dir
         self.max_records = max_records
+        self.recover_deleted_only = recover_deleted_only
+        self.logger = logger
         self.report: Dict[str, object] = {
             "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "source_image": image_path,
@@ -91,13 +103,17 @@ class NTFSReconstructor:
             "boot": {},
             "entries_scanned": 0,
             "files_written": 0,
+            "files_skipped_not_deleted": 0,
             "directories_created": 0,
             "errors": [],
             "written": [],
         }
 
     def log(self, msg: str):
-        print(msg, flush=True)
+        if self.logger:
+            self.logger(msg)
+        else:
+            print(msg, flush=True)
 
     def _safe_name(self, value: str) -> str:
         value = value.strip().replace("\x00", "")
@@ -310,7 +326,10 @@ class NTFSReconstructor:
 
             # Reconstruct files.
             for ent in entries.values():
-                if not ent.in_use or ent.is_dir:
+                if ent.is_dir:
+                    continue
+                if self.recover_deleted_only and ent.in_use:
+                    self.report["files_skipped_not_deleted"] += 1
                     continue
                 ds = ent.data_stream
                 if ds.resident_data is None and not ds.nonresident_runs:
@@ -351,14 +370,138 @@ class NTFSReconstructor:
         self.log(f"Reconstruction complete. Report: {report_path}")
 
 
+class NTFSReconstructionGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("NTFS Full Reconstruction")
+        self.root.geometry("900x700")
+        self.worker: Optional[threading.Thread] = None
+        self._build()
+
+    def _build(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill="both", expand=True)
+
+        src_box = ttk.LabelFrame(main, text="1. Source NTFS image/volume", padding=10)
+        src_box.pack(fill="x", pady=6)
+        self.src_entry = ttk.Entry(src_box)
+        self.src_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(src_box, text="Browse", command=self._pick_source).pack(side="left")
+
+        dst_box = ttk.LabelFrame(main, text="2. Output folder", padding=10)
+        dst_box.pack(fill="x", pady=6)
+        self.dst_entry = ttk.Entry(dst_box)
+        self.dst_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(dst_box, text="Browse", command=self._pick_destination).pack(side="left")
+
+        opts = ttk.LabelFrame(main, text="3. Options", padding=10)
+        opts.pack(fill="x", pady=6)
+        ttk.Label(opts, text="Max MFT records:").pack(side="left")
+        self.max_records_entry = ttk.Entry(opts, width=10)
+        self.max_records_entry.insert(0, "250000")
+        self.max_records_entry.pack(side="left", padx=(8, 20))
+        self.deleted_only_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts,
+            text="Skip files that are not deleted (recover deleted entries only)",
+            variable=self.deleted_only_var,
+        ).pack(side="left")
+
+        ctl = ttk.Frame(main)
+        ctl.pack(fill="x", pady=10)
+        self.start_btn = ttk.Button(ctl, text="START RECONSTRUCTION", command=self._start)
+        self.start_btn.pack(side="left", fill="x", expand=True)
+
+        self.log_box = scrolledtext.ScrolledText(main, height=24)
+        self.log_box.pack(fill="both", expand=True)
+
+    def _pick_source(self):
+        path = filedialog.askopenfilename(title="Select NTFS image/raw volume file")
+        if path:
+            self.src_entry.delete(0, tk.END)
+            self.src_entry.insert(0, path)
+
+    def _pick_destination(self):
+        path = filedialog.askdirectory(title="Select output folder")
+        if path:
+            self.dst_entry.delete(0, tk.END)
+            self.dst_entry.insert(0, path)
+
+    def _log(self, message: str):
+        self.root.after(0, lambda: self.log_box.insert(tk.END, f"{message}\n") or self.log_box.see(tk.END))
+
+    def _start(self):
+        source = self.src_entry.get().strip()
+        destination = self.dst_entry.get().strip()
+        if not source or not destination:
+            messagebox.showerror("Missing input", "Please select source and destination.")
+            return
+        try:
+            max_records = int(self.max_records_entry.get().strip())
+            if max_records <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid max records", "Max MFT records must be a positive integer.")
+            return
+
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Running", "A reconstruction job is already running.")
+            return
+
+        self.start_btn.config(state="disabled")
+        self.log_box.delete("1.0", tk.END)
+
+        def run():
+            try:
+                recon = NTFSReconstructor(
+                    source,
+                    destination,
+                    max_records=max_records,
+                    recover_deleted_only=self.deleted_only_var.get(),
+                    logger=self._log,
+                )
+                recon.reconstruct()
+                self.root.after(0, lambda: messagebox.showinfo("Done", "Reconstruction complete."))
+            except Exception as ex:
+                self._log(f"Error: {ex}")
+                self.root.after(0, lambda: messagebox.showerror("Failed", str(ex)))
+            finally:
+                self.root.after(0, lambda: self.start_btn.config(state="normal"))
+
+        self.worker = threading.Thread(target=run, daemon=True)
+        self.worker.start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Full NTFS reconstruction from a disk image/volume.")
-    parser.add_argument("source", help="Path to NTFS disk image or raw volume")
-    parser.add_argument("destination", help="Output directory for reconstructed files")
+    parser.add_argument("source", nargs="?", help="Path to NTFS disk image or raw volume")
+    parser.add_argument("destination", nargs="?", help="Output directory for reconstructed files")
     parser.add_argument("--max-records", type=int, default=250000, help="Maximum number of MFT records to scan")
+    parser.add_argument(
+        "--include-active",
+        action="store_true",
+        help="Also reconstruct files that are still active (not deleted).",
+    )
+    parser.add_argument("--gui", action="store_true", help="Launch the desktop GUI.")
     args = parser.parse_args()
 
-    recon = NTFSReconstructor(args.source, args.destination, args.max_records)
+    # Default UX: launch GUI when no positional CLI parameters are provided.
+    # CLI mode is used when source/destination are passed explicitly.
+    if args.gui or (not args.source and not args.destination):
+        root = tk.Tk()
+        NTFSReconstructionGUI(root)
+        root.mainloop()
+        return
+
+    if not args.source or not args.destination:
+        parser.error("source and destination are required unless --gui is used")
+
+    recon = NTFSReconstructor(
+        args.source,
+        args.destination,
+        args.max_records,
+        recover_deleted_only=not args.include_active,
+    )
     recon.reconstruct()
 
 
