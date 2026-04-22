@@ -1188,7 +1188,13 @@ class UniversalRecoveryApp:
 
                 is_viable = self._is_file_viable(filename, ftype)
                 if not is_viable:
-                    self.log(f"Recovered {ftype} @ {hex(start)} failed viability checks. Keeping raw carved output without repair.")
+                    self.log(f"Recovered {ftype} @ {hex(start)} failed viability checks. Attempting simple repair...")
+                    if self._attempt_file_repair(filename, ftype):
+                        self.log(f"Simple repair successful for {ftype} @ {hex(start)}.")
+                        is_viable = True
+                        repaired = True
+                    else:
+                        self.log(f"Simple repair failed for {ftype} @ {hex(start)}. Keeping raw carved output.")
 
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
