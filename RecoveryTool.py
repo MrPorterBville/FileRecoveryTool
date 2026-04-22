@@ -9,6 +9,9 @@ import bisect
 import ctypes
 import json
 import zlib
+import math
+import struct
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 import zipfile
 
@@ -28,6 +31,8 @@ THUMBNAIL_CUTOFF_BYTES = 200 * 1024
 JPG_MIN_END_OFFSET_BYTES = 512 * 1024
 DEFAULT_MIN_JPG_BYTES = 20 * 1024
 DEFAULT_MIN_JPG_DIMENSION = 250
+FORCE_RENDER_WIDTHS = (256, 320, 512, 640, 800, 1024, 1280, 1600, 1920)
+PARALLEL_SCAN_MIN_CHUNK = 2 * 1024 * 1024
 
 CONFIG = {
     'JPG': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'max': 30*1024*1024, 'greedy': False},
@@ -178,6 +183,10 @@ class UniversalRecoveryApp:
             header_map = {CONFIG[t]['header']: t for t in active_types}
             header_offsets = {t: (4 if t == "MP4" else 0) for t in active_types}
             pattern = re.compile(b'|'.join([re.escape(h) for h in header_map.keys()]))
+            header_overlap = max(len(h) for h in header_map.keys()) if header_map else 0
+            scan_workers = max(1, min(8, (os.cpu_count() or 1)))
+            if scan_workers > 1:
+                self.log(f"Parallel signature scanning enabled with {scan_workers} workers.")
 
             with open(src, "rb") as f:
                 self.log("Pass 2/4: signature carving.")
@@ -192,9 +201,8 @@ class UniversalRecoveryApp:
 
                     if total_size: self.pbar['value'] = (current_seek / total_size) * 100
                     
-                    for match in pattern.finditer(chunk):
-                        found_idx = match.start()
-                        header = match.group()
+                    matches = self._find_signature_matches_parallel(chunk, pattern, scan_workers, header_overlap)
+                    for found_idx, header in matches:
                         ftype = header_map.get(header)
                         abs_start = current_seek + found_idx - header_offsets.get(ftype, 0)
                         if abs_start < 0 or not ftype or abs_start in processed_offsets:
@@ -233,6 +241,37 @@ class UniversalRecoveryApp:
         starts, ends = alloc_filter
         idx = bisect.bisect_right(starts, offset) - 1
         return idx >= 0 and offset < ends[idx]
+
+    def _find_signature_matches_parallel(self, chunk, pattern, worker_count, overlap_bytes):
+        if worker_count <= 1 or len(chunk) < PARALLEL_SCAN_MIN_CHUNK:
+            return [(m.start(), m.group()) for m in pattern.finditer(chunk)]
+
+        seg_size = max(PARALLEL_SCAN_MIN_CHUNK, len(chunk) // worker_count)
+        segments = []
+        start = 0
+        while start < len(chunk):
+            end = min(len(chunk), start + seg_size)
+            segments.append((start, end))
+            start = end
+
+        def scan_segment(seg_start, seg_end):
+            local_start = max(0, seg_start - overlap_bytes)
+            local_end = min(len(chunk), seg_end + overlap_bytes)
+            sub = chunk[local_start:local_end]
+            hits = []
+            for match in pattern.finditer(sub):
+                abs_idx = local_start + match.start()
+                if seg_start <= abs_idx < seg_end:
+                    hits.append((abs_idx, match.group()))
+            return hits
+
+        matches = []
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [pool.submit(scan_segment, seg_start, seg_end) for seg_start, seg_end in segments]
+            for future in futures:
+                matches.extend(future.result())
+        matches.sort(key=lambda x: x[0])
+        return matches
 
     def _run_metadata_pass(self, src, is_physical):
         # Best-effort lightweight metadata signal discovery.
@@ -896,6 +935,82 @@ class UniversalRecoveryApp:
         except Exception:
             return False
 
+    def _force_render_jpg_preview(self, path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                return None
+
+            start = data.find(b"\xFF\xD8")
+            end = data.rfind(b"\xFF\xD9")
+            if start != -1:
+                if end != -1 and end > start:
+                    data = data[start:end + 2]
+                else:
+                    data = data[start:]
+
+            data = data.replace(b"\xFF\xD8", b"").replace(b"\xFF\xD9", b"")
+            if not data:
+                return None
+
+            arr = bytearray(data)
+            usable_len = (len(arr) // 3) * 3
+            if usable_len <= 0:
+                return None
+            arr = arr[:usable_len]
+
+            width = None
+            height = None
+            for candidate in FORCE_RENDER_WIDTHS:
+                h = usable_len // (3 * candidate)
+                if h >= 8:
+                    width = candidate
+                    height = h
+                    break
+
+            if width is None or height is None:
+                px = usable_len // 3
+                side = int(math.sqrt(px))
+                if side < 8:
+                    return None
+                width = side
+                height = side
+
+            pixels = width * height * 3
+            rgb = bytes(arr[:pixels])
+            base, _ = os.path.splitext(path)
+            png_path = base + "_force_preview.png"
+
+            def chunk(ctype, payload):
+                c = ctype + payload
+                return (
+                    struct.pack(">I", len(payload))
+                    + c
+                    + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+                )
+
+            rows = []
+            stride = width * 3
+            for y in range(height):
+                row = rgb[y * stride:(y + 1) * stride]
+                rows.append(b"\x00" + row)  # PNG filter type 0 (None)
+            raw = b"".join(rows)
+            compressed = zlib.compress(raw, level=6)
+
+            png = b"".join([
+                b"\x89PNG\r\n\x1a\n",
+                chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),
+                chunk(b"IDAT", compressed),
+                chunk(b"IEND", b""),
+            ])
+
+            with open(png_path, "wb") as out:
+                out.write(png)
+            return png_path
+        except Exception:
+            return None
+
     def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive, skip_thumbnails):
         try:
             cfg = CONFIG[ftype]
@@ -906,6 +1021,7 @@ class UniversalRecoveryApp:
             stitch_trace = []
             stitch_confidence = 0.0
             repaired = False
+            forced_preview_path = None
             nested_jpeg_count = 0
             jpg_dimensions = (None, None)
             exif_ranges = []
@@ -1043,12 +1159,26 @@ class UniversalRecoveryApp:
                         is_viable = True
                         repaired = True
                     else:
-                        self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
-                        try:
-                            os.remove(filename)
-                        except OSError:
-                            pass
-                        return
+                        if ftype == "JPG":
+                            forced_preview_path = self._force_render_jpg_preview(filename)
+                            if forced_preview_path:
+                                self.log(f"Repair failed for JPG @ {hex(start)}. Force-render preview generated: {forced_preview_path}")
+                                repaired = True
+                                is_viable = True
+                            else:
+                                self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
+                                try:
+                                    os.remove(filename)
+                                except OSError:
+                                    pass
+                                return
+                        else:
+                            self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
+                            try:
+                                os.remove(filename)
+                            except OSError:
+                                pass
+                            return
 
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
@@ -1062,6 +1192,7 @@ class UniversalRecoveryApp:
                         "type": ftype,
                         "source_offset": start,
                         "output_path": filename,
+                        "forced_preview_path": forced_preview_path,
                         "bytes_recovered": rec_len,
                         "aggressive_mode": aggressive,
                         "fragment_stitch_bytes": stitched,
