@@ -1187,8 +1187,31 @@ class UniversalRecoveryApp:
                             forced_preview_path = self._force_render_jpg_preview(filename)
                             if forced_preview_path:
                                 self.log(f"Repair failed for JPG @ {hex(start)}. Force-render preview generated: {forced_preview_path}")
-                                repaired = True
-                                is_viable = True
+                                try:
+                                    os.remove(filename)
+                                except OSError:
+                                    pass
+                                with self.report_lock:
+                                    self.recovery_report.append({
+                                        "id": None,
+                                        "type": "JPG_PREVIEW",
+                                        "source_offset": start,
+                                        "output_path": forced_preview_path,
+                                        "forced_preview_path": forced_preview_path,
+                                        "bytes_recovered": rec_len,
+                                        "aggressive_mode": aggressive,
+                                        "fragment_stitch_bytes": stitched,
+                                        "fragment_trace": stitch_trace,
+                                        "validator_passed": False,
+                                        "repair_applied": False,
+                                        "confidence": 0.25,
+                                        "jpg_dimensions": {"width": jpg_dimensions[0], "height": jpg_dimensions[1]},
+                                        "nested_jpeg_count": nested_jpeg_count,
+                                        "secondary_image_detected": (nested_jpeg_count > 0),
+                                        "exif_thumbnail_ranges": exif_ranges,
+                                        "preview_only": True,
+                                    })
+                                return {"exclude_ranges": exif_ranges, "container_range": None}
                             else:
                                 self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
                                 try:
