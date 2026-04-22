@@ -10,6 +10,7 @@ import ctypes
 import json
 import zlib
 import math
+import struct
 from ctypes import wintypes
 import zipfile
 
@@ -943,11 +944,34 @@ class UniversalRecoveryApp:
             pixels = width * height * 3
             rgb = bytes(arr[:pixels])
             base, _ = os.path.splitext(path)
-            ppm_path = base + "_force_preview.ppm"
-            with open(ppm_path, "wb") as out:
-                out.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
-                out.write(rgb)
-            return ppm_path
+            png_path = base + "_force_preview.png"
+
+            def chunk(ctype, payload):
+                c = ctype + payload
+                return (
+                    struct.pack(">I", len(payload))
+                    + c
+                    + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+                )
+
+            rows = []
+            stride = width * 3
+            for y in range(height):
+                row = rgb[y * stride:(y + 1) * stride]
+                rows.append(b"\x00" + row)  # PNG filter type 0 (None)
+            raw = b"".join(rows)
+            compressed = zlib.compress(raw, level=6)
+
+            png = b"".join([
+                b"\x89PNG\r\n\x1a\n",
+                chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),
+                chunk(b"IDAT", compressed),
+                chunk(b"IEND", b""),
+            ])
+
+            with open(png_path, "wb") as out:
+                out.write(png)
+            return png_path
         except Exception:
             return None
 
