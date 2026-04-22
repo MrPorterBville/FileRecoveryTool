@@ -9,6 +9,10 @@ import bisect
 import ctypes
 import json
 import zlib
+import math
+import struct
+import io
+from concurrent.futures import ThreadPoolExecutor
 from ctypes import wintypes
 import zipfile
 
@@ -28,6 +32,8 @@ THUMBNAIL_CUTOFF_BYTES = 200 * 1024
 JPG_MIN_END_OFFSET_BYTES = 512 * 1024
 DEFAULT_MIN_JPG_BYTES = 20 * 1024
 DEFAULT_MIN_JPG_DIMENSION = 250
+FORCE_RENDER_WIDTHS = (256, 320, 512, 640, 800, 1024, 1280, 1600, 1920)
+PARALLEL_SCAN_MIN_CHUNK = 2 * 1024 * 1024
 
 CONFIG = {
     'JPG': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'max': 30*1024*1024, 'greedy': False},
@@ -154,7 +160,7 @@ class UniversalRecoveryApp:
         is_physical = src.startswith("\\\\.\\")
         processed_offsets = set()
         alloc_filter = None
-        skip_thumbnails = self.skip_small_jpg_var.get()
+        skip_thumbnail_candidates = self.skip_exif_thumbs_var.get()
         jpg_exclusion_ranges = []
         self.recovery_report = []
         
@@ -178,6 +184,10 @@ class UniversalRecoveryApp:
             header_map = {CONFIG[t]['header']: t for t in active_types}
             header_offsets = {t: (4 if t == "MP4" else 0) for t in active_types}
             pattern = re.compile(b'|'.join([re.escape(h) for h in header_map.keys()]))
+            header_overlap = max(len(h) for h in header_map.keys()) if header_map else 0
+            scan_workers = max(1, min(8, (os.cpu_count() or 1)))
+            if scan_workers > 1:
+                self.log(f"Parallel signature scanning enabled with {scan_workers} workers.")
 
             with open(src, "rb") as f:
                 self.log("Pass 2/4: signature carving.")
@@ -192,24 +202,24 @@ class UniversalRecoveryApp:
 
                     if total_size: self.pbar['value'] = (current_seek / total_size) * 100
                     
-                    for match in pattern.finditer(chunk):
-                        found_idx = match.start()
-                        header = match.group()
+                    matches = self._find_signature_matches_parallel(chunk, pattern, scan_workers, header_overlap)
+                    for found_idx, header in matches:
+                        if self.stop_event.is_set():
+                            break
                         ftype = header_map.get(header)
                         abs_start = current_seek + found_idx - header_offsets.get(ftype, 0)
                         if abs_start < 0 or not ftype or abs_start in processed_offsets:
                             continue
                         if ftype == "MP4" and not self._looks_like_mp4_header_at(chunk, found_idx):
                             continue
-                        if ftype == "JPG" and self.skip_exif_thumbs_var.get() and self._in_ranges(abs_start, jpg_exclusion_ranges):
-                            self.log(f"Skipped JPG signature in EXIF thumbnail region @ {hex(abs_start)}.")
-                            continue
                         if alloc_filter and self._offset_is_allocated(abs_start, alloc_filter):
                             continue
                         processed_offsets.add(abs_start)
+                        if self.stop_event.is_set():
+                            break
                         extract_result = self.extract(
                             src, abs_start, ftype, dst, active_types, is_physical,
-                            self.aggressive_var.get(), skip_thumbnails
+                            self.aggressive_var.get(), skip_thumbnail_candidates
                         )
                         if ftype == "JPG" and extract_result and extract_result.get("exclude_ranges"):
                             jpg_exclusion_ranges.extend(extract_result["exclude_ranges"])
@@ -233,6 +243,45 @@ class UniversalRecoveryApp:
         starts, ends = alloc_filter
         idx = bisect.bisect_right(starts, offset) - 1
         return idx >= 0 and offset < ends[idx]
+
+    def _find_signature_matches_parallel(self, chunk, pattern, worker_count, overlap_bytes):
+        if self.stop_event.is_set():
+            return []
+        if worker_count <= 1 or len(chunk) < PARALLEL_SCAN_MIN_CHUNK:
+            return [(m.start(), m.group()) for m in pattern.finditer(chunk)]
+
+        seg_size = max(PARALLEL_SCAN_MIN_CHUNK, len(chunk) // worker_count)
+        segments = []
+        start = 0
+        while start < len(chunk):
+            end = min(len(chunk), start + seg_size)
+            segments.append((start, end))
+            start = end
+
+        def scan_segment(seg_start, seg_end):
+            if self.stop_event.is_set():
+                return []
+            local_start = max(0, seg_start - overlap_bytes)
+            local_end = min(len(chunk), seg_end + overlap_bytes)
+            sub = chunk[local_start:local_end]
+            hits = []
+            for match in pattern.finditer(sub):
+                if self.stop_event.is_set():
+                    break
+                abs_idx = local_start + match.start()
+                if seg_start <= abs_idx < seg_end:
+                    hits.append((abs_idx, match.group()))
+            return hits
+
+        matches = []
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [pool.submit(scan_segment, seg_start, seg_end) for seg_start, seg_end in segments]
+            for future in futures:
+                if self.stop_event.is_set():
+                    break
+                matches.extend(future.result())
+        matches.sort(key=lambda x: x[0])
+        return matches
 
     def _run_metadata_pass(self, src, is_physical):
         # Best-effort lightweight metadata signal discovery.
@@ -811,7 +860,14 @@ class UniversalRecoveryApp:
                 data = f.read()
             if not data:
                 return False
+            return self._is_data_viable(ftype, data)
+        except Exception:
+            return False
 
+    def _is_data_viable(self, ftype, data):
+        try:
+            if not data:
+                return False
             if ftype == "JPG":
                 return self._validate_jpeg(data)
             if ftype == "PNG":
@@ -819,7 +875,7 @@ class UniversalRecoveryApp:
             if ftype == "PDF":
                 return self._validate_pdf(data)
             if ftype == "ZIP":
-                with zipfile.ZipFile(path, "r") as zf:
+                with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
                     return zf.testzip() is None
             if ftype == "MP4":
                 return self._validate_mp4(data)
@@ -890,11 +946,90 @@ class UniversalRecoveryApp:
                 return False
 
             if repaired and repaired != data:
+                if not self._is_data_viable(ftype, repaired):
+                    return False
                 with open(path, "wb") as f:
                     f.write(repaired)
+                return True
             return self._is_file_viable(path, ftype)
         except Exception:
             return False
+
+    def _force_render_jpg_preview(self, path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                return None
+
+            start = data.find(b"\xFF\xD8")
+            end = data.rfind(b"\xFF\xD9")
+            if start != -1:
+                if end != -1 and end > start:
+                    data = data[start:end + 2]
+                else:
+                    data = data[start:]
+
+            data = data.replace(b"\xFF\xD8", b"").replace(b"\xFF\xD9", b"")
+            if not data:
+                return None
+
+            arr = bytearray(data)
+            usable_len = (len(arr) // 3) * 3
+            if usable_len <= 0:
+                return None
+            arr = arr[:usable_len]
+
+            width = None
+            height = None
+            for candidate in FORCE_RENDER_WIDTHS:
+                h = usable_len // (3 * candidate)
+                if h >= 8:
+                    width = candidate
+                    height = h
+                    break
+
+            if width is None or height is None:
+                px = usable_len // 3
+                side = int(math.sqrt(px))
+                if side < 8:
+                    return None
+                width = side
+                height = side
+
+            pixels = width * height * 3
+            rgb = bytes(arr[:pixels])
+            base, _ = os.path.splitext(path)
+            png_path = base + "_force_preview.png"
+
+            def chunk(ctype, payload):
+                c = ctype + payload
+                return (
+                    struct.pack(">I", len(payload))
+                    + c
+                    + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+                )
+
+            rows = []
+            stride = width * 3
+            for y in range(height):
+                row = rgb[y * stride:(y + 1) * stride]
+                rows.append(b"\x00" + row)  # PNG filter type 0 (None)
+            raw = b"".join(rows)
+            compressed = zlib.compress(raw, level=6)
+
+            png = b"".join([
+                b"\x89PNG\r\n\x1a\n",
+                chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),
+                chunk(b"IDAT", compressed),
+                chunk(b"IEND", b""),
+            ])
+
+            with open(png_path, "wb") as out:
+                out.write(png)
+            return png_path
+        except Exception:
+            return None
 
     def extract(self, src, start, ftype, dst, active_types, is_physical, aggressive, skip_thumbnails):
         try:
@@ -906,6 +1041,7 @@ class UniversalRecoveryApp:
             stitch_trace = []
             stitch_confidence = 0.0
             repaired = False
+            forced_preview_path = None
             nested_jpeg_count = 0
             jpg_dimensions = (None, None)
             exif_ranges = []
@@ -927,6 +1063,8 @@ class UniversalRecoveryApp:
                 first = True
                 found_end = False
                 jpg_min_end_offset = JPG_MIN_END_OFFSET_BYTES if skip_thumbnails else 150 * 1024
+                if ftype == "JPG" and self.skip_small_jpg_var.get():
+                    jpg_min_end_offset = max(jpg_min_end_offset, min_jpg_bytes)
                 lb_size = max(len(cfg['footer']) - 1, 32) if cfg['footer'] else 32
                 lookbehind = b''
                 # For greedy formats (MP4/ZIP), very short signatures such as JPG's
@@ -941,6 +1079,8 @@ class UniversalRecoveryApp:
 
                 if ftype == "JPG":
                     blob = fin.read(cfg['max'] + skip)
+                    if self.stop_event.is_set():
+                        return {"exclude_ranges": exif_ranges, "container_range": None}
                     blob = blob[skip:] if skip else blob
                     parsed = self._parse_jpeg_structure(blob, min_end_offset=jpg_min_end_offset)
                     carve_end = parsed["end_offset"] if parsed["end_offset"] else len(blob)
@@ -1017,14 +1157,14 @@ class UniversalRecoveryApp:
                         self.log(f"Skipped likely thumbnail {ftype} @ {hex(start)} ({rec_len // 1024} KB).")
                     except OSError:
                         pass
-                    return {"exclude_ranges": exif_ranges}
+                    return {"exclude_ranges": exif_ranges, "container_range": None}
                 if ftype == "JPG" and self.skip_small_jpg_var.get() and rec_len < min_jpg_bytes:
                     try:
                         os.remove(filename)
                         self.log(f"Skipped small JPG @ {hex(start)} ({rec_len // 1024} KB < {min_jpg_bytes // 1024} KB).")
                     except OSError:
                         pass
-                    return {"exclude_ranges": exif_ranges}
+                    return {"exclude_ranges": exif_ranges, "container_range": None}
                 if ftype == "JPG" and self.skip_small_dimensions_var.get():
                     w, h = jpg_dimensions
                     if w and h and (w < min_jpg_dimension or h < min_jpg_dimension):
@@ -1033,22 +1173,17 @@ class UniversalRecoveryApp:
                             self.log(f"Skipped thumbnail-sized JPG @ {hex(start)} ({w}x{h}).")
                         except OSError:
                             pass
-                        return {"exclude_ranges": exif_ranges}
+                        return {"exclude_ranges": exif_ranges, "container_range": None}
 
                 is_viable = self._is_file_viable(filename, ftype)
                 if not is_viable:
-                    self.log(f"Recovered {ftype} @ {hex(start)} failed viability check. Attempting repair...")
+                    self.log(f"Recovered {ftype} @ {hex(start)} failed viability checks. Attempting simple repair...")
                     if self._attempt_file_repair(filename, ftype):
-                        self.log(f"Repair successful for {ftype} @ {hex(start)}.")
+                        self.log(f"Simple repair successful for {ftype} @ {hex(start)}.")
                         is_viable = True
                         repaired = True
                     else:
-                        self.log(f"Repair failed for {ftype} @ {hex(start)}. Discarding likely false positive.")
-                        try:
-                            os.remove(filename)
-                        except OSError:
-                            pass
-                        return
+                        self.log(f"Simple repair failed for {ftype} @ {hex(start)}. Keeping raw carved output.")
 
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
@@ -1062,6 +1197,7 @@ class UniversalRecoveryApp:
                         "type": ftype,
                         "source_offset": start,
                         "output_path": filename,
+                        "forced_preview_path": forced_preview_path,
                         "bytes_recovered": rec_len,
                         "aggressive_mode": aggressive,
                         "fragment_stitch_bytes": stitched,
@@ -1074,10 +1210,11 @@ class UniversalRecoveryApp:
                         "secondary_image_detected": (nested_jpeg_count > 0) if ftype == "JPG" else False,
                         "exif_thumbnail_ranges": exif_ranges if ftype == "JPG" else [],
                     })
-            return {"exclude_ranges": exif_ranges}
+            container_range = (start, start + rec_len) if (ftype == "JPG" and rec_len > 0) else None
+            return {"exclude_ranges": exif_ranges, "container_range": container_range}
         except Exception as e:
             self.log(f"Extraction failure for {ftype} @ {hex(start)}: {e}")
-            return {"exclude_ranges": []}
+            return {"exclude_ranges": [], "container_range": None}
 
 if __name__ == "__main__":
     root = tk.Tk()
