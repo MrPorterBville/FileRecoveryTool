@@ -162,6 +162,7 @@ class UniversalRecoveryApp:
         alloc_filter = None
         skip_thumbnail_candidates = self.skip_exif_thumbs_var.get()
         jpg_exclusion_ranges = []
+        jpg_container_ranges = []
         self.recovery_report = []
         
         try:
@@ -223,6 +224,10 @@ class UniversalRecoveryApp:
                         )
                         if ftype == "JPG" and extract_result and extract_result.get("exclude_ranges"):
                             jpg_exclusion_ranges.extend(extract_result["exclude_ranges"])
+                        if ftype == "JPG" and extract_result and extract_result.get("container_range"):
+                            cstart, cend = extract_result["container_range"]
+                            if cend > cstart:
+                                jpg_container_ranges.append((cstart, cend))
 
                     off = current_seek + CHUNK_SIZE - SCAN_OVERLAP
                 self.log("Pass 2/4 complete.")
