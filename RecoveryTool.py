@@ -26,6 +26,8 @@ FRAGMENT_BEAM_WIDTH = 6
 MAX_FRAGMENT_PATH_DEPTH = 10
 THUMBNAIL_CUTOFF_BYTES = 200 * 1024
 JPG_MIN_END_OFFSET_BYTES = 512 * 1024
+DEFAULT_MIN_JPG_BYTES = 20 * 1024
+DEFAULT_MIN_JPG_DIMENSION = 250
 
 CONFIG = {
     'JPG': {'header': b'\xFF\xD8\xFF', 'footer': b'\xFF\xD9', 'max': 30*1024*1024, 'greedy': False},
@@ -47,6 +49,11 @@ class UniversalRecoveryApp:
         self.check_vars = {}
         self.aggressive_var = tk.BooleanVar(value=False)
         self.unallocated_only_var = tk.BooleanVar(value=False)
+        self.skip_exif_thumbs_var = tk.BooleanVar(value=True)
+        self.skip_small_jpg_var = tk.BooleanVar(value=True)
+        self.min_jpg_size_kb_var = tk.IntVar(value=20)
+        self.skip_small_dimensions_var = tk.BooleanVar(value=True)
+        self.min_jpg_dimension_var = tk.IntVar(value=DEFAULT_MIN_JPG_DIMENSION)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -72,6 +79,14 @@ class UniversalRecoveryApp:
             ttk.Checkbutton(filter_frame, text=ftype, variable=var).pack(side="left", padx=15)
         ttk.Checkbutton(filter_frame, text="Aggressive fragmented mode", variable=self.aggressive_var).pack(side="left", padx=15)
         ttk.Checkbutton(filter_frame, text="Recover from unallocated space only (Windows NTFS, best-effort)", variable=self.unallocated_only_var).pack(side="left", padx=15)
+        
+        jpg_filter_frame = ttk.LabelFrame(main, text=" 2b. JPG Quality Filters ", padding=10)
+        jpg_filter_frame.pack(fill="x", pady=5)
+        ttk.Checkbutton(jpg_filter_frame, text="Skip EXIF thumbnail regions", variable=self.skip_exif_thumbs_var).pack(side="left", padx=10)
+        ttk.Checkbutton(jpg_filter_frame, text="Ignore JPGs smaller than (KB):", variable=self.skip_small_jpg_var).pack(side="left", padx=10)
+        ttk.Spinbox(jpg_filter_frame, from_=1, to=50000, width=8, textvariable=self.min_jpg_size_kb_var).pack(side="left", padx=5)
+        ttk.Checkbutton(jpg_filter_frame, text="Ignore JPG dimensions below (px):", variable=self.skip_small_dimensions_var).pack(side="left", padx=10)
+        ttk.Spinbox(jpg_filter_frame, from_=32, to=10000, width=8, textvariable=self.min_jpg_dimension_var).pack(side="left", padx=5)
 
         # --- Destination ---
         dst_frame = ttk.LabelFrame(main, text=" 3. Save Destination ", padding=10)
@@ -139,7 +154,8 @@ class UniversalRecoveryApp:
         is_physical = src.startswith("\\\\.\\")
         processed_offsets = set()
         alloc_filter = None
-        skip_thumbnails = True
+        skip_thumbnails = self.skip_small_jpg_var.get()
+        jpg_exclusion_ranges = []
         self.recovery_report = []
         
         try:
@@ -185,13 +201,18 @@ class UniversalRecoveryApp:
                             continue
                         if ftype == "MP4" and not self._looks_like_mp4_header_at(chunk, found_idx):
                             continue
+                        if ftype == "JPG" and self.skip_exif_thumbs_var.get() and self._in_ranges(abs_start, jpg_exclusion_ranges):
+                            self.log(f"Skipped JPG signature in EXIF thumbnail region @ {hex(abs_start)}.")
+                            continue
                         if alloc_filter and self._offset_is_allocated(abs_start, alloc_filter):
                             continue
                         processed_offsets.add(abs_start)
-                        self.extract(
+                        extract_result = self.extract(
                             src, abs_start, ftype, dst, active_types, is_physical,
                             self.aggressive_var.get(), skip_thumbnails
                         )
+                        if ftype == "JPG" and extract_result and extract_result.get("exclude_ranges"):
+                            jpg_exclusion_ranges.extend(extract_result["exclude_ranges"])
 
                     off = current_seek + CHUNK_SIZE - SCAN_OVERLAP
                 self.log("Pass 2/4 complete.")
@@ -574,10 +595,168 @@ class UniversalRecoveryApp:
             pos += size
         return boxes, pos
 
+    def _in_ranges(self, offset, ranges):
+        return any(start <= offset < end for start, end in ranges)
+
+    def _parse_exif_thumbnail_ranges(self, app1_payload, app1_payload_start):
+        if not app1_payload.startswith(b"Exif\x00\x00") or len(app1_payload) < 14:
+            return []
+        tiff_rel = 6
+        tiff = app1_payload[tiff_rel:]
+        byte_order = tiff[0:2]
+        if byte_order == b"II":
+            endian = "little"
+        elif byte_order == b"MM":
+            endian = "big"
+        else:
+            return []
+        if int.from_bytes(tiff[2:4], endian) != 42:
+            return []
+
+        def read_u16(rel):
+            if rel + 2 > len(tiff):
+                return None
+            return int.from_bytes(tiff[rel:rel + 2], endian)
+
+        def read_u32(rel):
+            if rel + 4 > len(tiff):
+                return None
+            return int.from_bytes(tiff[rel:rel + 4], endian)
+
+        ifd0_rel = read_u32(4)
+        if ifd0_rel is None or ifd0_rel >= len(tiff):
+            return []
+        ifd0_count = read_u16(ifd0_rel)
+        if ifd0_count is None:
+            return []
+        next_ifd_ptr_rel = ifd0_rel + 2 + (ifd0_count * 12)
+        ifd1_rel = read_u32(next_ifd_ptr_rel)
+        if ifd1_rel is None or ifd1_rel == 0 or ifd1_rel >= len(tiff):
+            return []
+
+        ifd1_count = read_u16(ifd1_rel)
+        if ifd1_count is None:
+            return []
+
+        thumb_offset = None
+        thumb_length = None
+        base = ifd1_rel + 2
+        for i in range(ifd1_count):
+            entry_rel = base + (i * 12)
+            if entry_rel + 12 > len(tiff):
+                break
+            tag = int.from_bytes(tiff[entry_rel:entry_rel + 2], endian)
+            value = int.from_bytes(tiff[entry_rel + 8:entry_rel + 12], endian)
+            if tag == 0x0201:
+                thumb_offset = value
+            elif tag == 0x0202:
+                thumb_length = value
+
+        if thumb_offset is None or thumb_length is None or thumb_length <= 0:
+            return []
+
+        abs_start = app1_payload_start + tiff_rel + thumb_offset
+        abs_end = abs_start + thumb_length
+        if abs_end <= abs_start:
+            return []
+        return [(abs_start, abs_end)]
+
+    def _parse_jpeg_structure(self, data, min_end_offset=0):
+        result = {
+            "end_offset": None,
+            "width": None,
+            "height": None,
+            "nested_count": 0,
+            "exif_thumbnail_ranges": [],
+        }
+        if len(data) < 4 or not data.startswith(b"\xFF\xD8"):
+            return result
+
+        pos = 2
+        while pos + 1 < len(data):
+            if data[pos] != 0xFF:
+                pos += 1
+                continue
+
+            while pos < len(data) and data[pos] == 0xFF:
+                pos += 1
+            if pos >= len(data):
+                break
+            marker = data[pos]
+            pos += 1
+
+            if marker == 0xD9:
+                eoi_end = pos
+                if eoi_end >= min_end_offset:
+                    result["end_offset"] = eoi_end
+                    return result
+                continue
+            if marker == 0xD8:
+                result["nested_count"] += 1
+                continue
+            if marker in (0x01, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7):
+                continue
+
+            if pos + 2 > len(data):
+                break
+            seg_len = int.from_bytes(data[pos:pos + 2], "big")
+            pos += 2
+            if seg_len < 2:
+                break
+            payload_start = pos
+            payload_end = pos + (seg_len - 2)
+            if payload_end > len(data):
+                break
+            payload = data[payload_start:payload_end]
+
+            if marker == 0xE1:
+                result["exif_thumbnail_ranges"].extend(self._parse_exif_thumbnail_ranges(payload, payload_start))
+            elif marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                if len(payload) >= 5:
+                    result["height"] = int.from_bytes(payload[1:3], "big")
+                    result["width"] = int.from_bytes(payload[3:5], "big")
+            elif marker == 0xDA:
+                scan_pos = payload_end
+                while scan_pos + 1 < len(data):
+                    if data[scan_pos] == 0xFF:
+                        nxt = data[scan_pos + 1]
+                        if nxt == 0x00:
+                            scan_pos += 2
+                            continue
+                        if nxt == 0xD8:
+                            result["nested_count"] += 1
+                        if nxt == 0xD9:
+                            eoi_end = scan_pos + 2
+                            if eoi_end >= min_end_offset:
+                                result["end_offset"] = eoi_end
+                                return result
+                            scan_pos += 2
+                            continue
+                        if 0xD0 <= nxt <= 0xD7:
+                            scan_pos += 2
+                            continue
+                        pos = scan_pos
+                        break
+                    scan_pos += 1
+                else:
+                    break
+                continue
+
+            soi_hits = payload.count(b"\xFF\xD8")
+            if soi_hits:
+                result["nested_count"] += soi_hits
+            pos = payload_end
+        return result
+
     def _validate_jpeg(self, data):
-        if not (data.startswith(b"\xFF\xD8") and data.endswith(b"\xFF\xD9")):
+        if not data.startswith(b"\xFF\xD8"):
             return False
-        return (b"\xFF\xDB" in data) or (b"\xFF\xC0" in data) or (b"\xFF\xC2" in data)
+        parsed = self._parse_jpeg_structure(data, min_end_offset=2)
+        if parsed["end_offset"] is None:
+            return False
+        if parsed["end_offset"] != len(data):
+            return False
+        return (parsed["width"] is not None) and (parsed["height"] is not None)
 
     def _validate_png(self, data):
         if not data.startswith(CONFIG["PNG"]["header"]):
@@ -727,6 +906,11 @@ class UniversalRecoveryApp:
             stitch_trace = []
             stitch_confidence = 0.0
             repaired = False
+            nested_jpeg_count = 0
+            jpg_dimensions = (None, None)
+            exif_ranges = []
+            min_jpg_bytes = max(1024, self.min_jpg_size_kb_var.get() * 1024) if self.skip_small_jpg_var.get() else DEFAULT_MIN_JPG_BYTES
+            min_jpg_dimension = max(1, self.min_jpg_dimension_var.get())
             
             with open(src, "rb") as fin, open(filename, "wb") as fout:
                 # Seek logic for mixed sources
@@ -754,58 +938,72 @@ class UniversalRecoveryApp:
                     if t != ftype and len(CONFIG[t]['header']) >= 4
                 ]
                 header_pattern = re.compile(b'|'.join([re.escape(h) for h in greedy_headers])) if greedy_headers else None
-                
-                while rec_len < cfg['max'] and not self.stop_event.is_set():
-                    buf = fin.read(io_size)
-                    if not buf: break
-                    if first:
-                        buf = buf[skip:]
-                        first = False
-                        if not buf:
-                            continue
 
-                    data = lookbehind + buf
+                if ftype == "JPG":
+                    blob = fin.read(cfg['max'] + skip)
+                    blob = blob[skip:] if skip else blob
+                    parsed = self._parse_jpeg_structure(blob, min_end_offset=jpg_min_end_offset)
+                    carve_end = parsed["end_offset"] if parsed["end_offset"] else len(blob)
+                    carve_end = min(carve_end, cfg['max'])
+                    if carve_end > 0:
+                        fout.write(blob[:carve_end])
+                        rec_len = carve_end
+                    found_end = parsed["end_offset"] is not None and parsed["end_offset"] <= cfg['max']
+                    nested_jpeg_count = parsed["nested_count"]
+                    jpg_dimensions = (parsed["width"], parsed["height"])
+                    exif_ranges = [(start + s, start + e) for s, e in parsed["exif_thumbnail_ranges"] if e > s]
+                else:
+                    while rec_len < cfg['max'] and not self.stop_event.is_set():
+                        buf = fin.read(io_size)
+                        if not buf: break
+                        if first:
+                            buf = buf[skip:]
+                            first = False
+                            if not buf:
+                                continue
 
-                    # Footer logic (boundary-safe) for JPG/PNG/PDF
-                    if cfg['footer']:
-                        fpos = data.find(cfg['footer'])
-                        if fpos != -1 and ((rec_len + fpos) > jpg_min_end_offset or ftype != 'JPG'):
-                            cut = fpos + len(cfg['footer'])
-                            to_write = data[:cut]
+                        data = lookbehind + buf
+
+                        # Footer logic (boundary-safe) for JPG/PNG/PDF
+                        if cfg['footer']:
+                            fpos = data.find(cfg['footer'])
+                            if fpos != -1 and ((rec_len + fpos) > jpg_min_end_offset or ftype != 'JPG'):
+                                cut = fpos + len(cfg['footer'])
+                                to_write = data[:cut]
+                                to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                                fout.write(to_write)
+                                rec_len += len(to_write)
+                                found_end = True
+                                break
+
+                        # Greedy logic for MP4/ZIP (also boundary-safe)
+                        if cfg['greedy'] and rec_len > 1024 * 1024 and header_pattern is not None:
+                            h_match = header_pattern.search(data)
+                            if h_match and h_match.start() > 0:
+                                h_pos = h_match.start()
+                                to_write = data[:h_pos]
+                                to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                                fout.write(to_write)
+                                rec_len += len(to_write)
+                                found_end = True
+                                break
+
+                        if len(data) > lb_size:
+                            flush_len = len(data) - lb_size
+                            to_write = data[:flush_len]
                             to_write = to_write[:max(0, cfg['max'] - rec_len)]
-                            fout.write(to_write)
-                            rec_len += len(to_write)
-                            found_end = True
-                            break
+                            if to_write:
+                                fout.write(to_write)
+                                rec_len += len(to_write)
+                            lookbehind = data[flush_len:]
+                        else:
+                            lookbehind = data
 
-                    # Greedy logic for MP4/ZIP (also boundary-safe)
-                    if cfg['greedy'] and rec_len > 1024 * 1024 and header_pattern is not None:
-                        h_match = header_pattern.search(data)
-                        if h_match and h_match.start() > 0:
-                            h_pos = h_match.start()
-                            to_write = data[:h_pos]
-                            to_write = to_write[:max(0, cfg['max'] - rec_len)]
-                            fout.write(to_write)
-                            rec_len += len(to_write)
-                            found_end = True
-                            break
-
-                    if len(data) > lb_size:
-                        flush_len = len(data) - lb_size
-                        to_write = data[:flush_len]
-                        to_write = to_write[:max(0, cfg['max'] - rec_len)]
+                    if lookbehind and rec_len < cfg['max'] and not found_end:
+                        to_write = lookbehind[:max(0, cfg['max'] - rec_len)]
                         if to_write:
                             fout.write(to_write)
                             rec_len += len(to_write)
-                        lookbehind = data[flush_len:]
-                    else:
-                        lookbehind = data
-
-                if lookbehind and rec_len < cfg['max'] and not found_end:
-                    to_write = lookbehind[:max(0, cfg['max'] - rec_len)]
-                    if to_write:
-                        fout.write(to_write)
-                        rec_len += len(to_write)
 
                 if aggressive and cfg['footer'] and not found_end and rec_len < cfg['max']:
                     rec_len, stitched, found_end, stitch_trace, stitch_confidence = self._stitch_fragmented(fin, fout, cfg, ftype, rec_len, lookbehind)
@@ -819,7 +1017,23 @@ class UniversalRecoveryApp:
                         self.log(f"Skipped likely thumbnail {ftype} @ {hex(start)} ({rec_len // 1024} KB).")
                     except OSError:
                         pass
-                    return
+                    return {"exclude_ranges": exif_ranges}
+                if ftype == "JPG" and self.skip_small_jpg_var.get() and rec_len < min_jpg_bytes:
+                    try:
+                        os.remove(filename)
+                        self.log(f"Skipped small JPG @ {hex(start)} ({rec_len // 1024} KB < {min_jpg_bytes // 1024} KB).")
+                    except OSError:
+                        pass
+                    return {"exclude_ranges": exif_ranges}
+                if ftype == "JPG" and self.skip_small_dimensions_var.get():
+                    w, h = jpg_dimensions
+                    if w and h and (w < min_jpg_dimension or h < min_jpg_dimension):
+                        try:
+                            os.remove(filename)
+                            self.log(f"Skipped thumbnail-sized JPG @ {hex(start)} ({w}x{h}).")
+                        except OSError:
+                            pass
+                        return {"exclude_ranges": exif_ranges}
 
                 is_viable = self._is_file_viable(filename, ftype)
                 if not is_viable:
@@ -839,6 +1053,8 @@ class UniversalRecoveryApp:
                 self.files_found += 1
                 sz = f"{rec_len // 1024} KB" if rec_len < 1024*1024 else f"{rec_len // (1024*1024)} MB"
                 self.root.after(0, lambda: self.tree.insert("", 0, values=(self.files_found, ftype, sz, hex(start))))
+                if ftype == "JPG" and nested_jpeg_count > 0:
+                    self.log(f"Detected nested JPEG markers in recovered JPG @ {hex(start)} (secondary images: {nested_jpeg_count}).")
                 confidence = min(1.0, 0.55 + (0.25 if is_viable else 0.0) + min(0.20, stitch_confidence * 0.20))
                 with self.report_lock:
                     self.recovery_report.append({
@@ -853,9 +1069,15 @@ class UniversalRecoveryApp:
                         "validator_passed": is_viable,
                         "repair_applied": repaired,
                         "confidence": round(confidence, 4),
+                        "jpg_dimensions": {"width": jpg_dimensions[0], "height": jpg_dimensions[1]} if ftype == "JPG" else None,
+                        "nested_jpeg_count": nested_jpeg_count if ftype == "JPG" else 0,
+                        "secondary_image_detected": (nested_jpeg_count > 0) if ftype == "JPG" else False,
+                        "exif_thumbnail_ranges": exif_ranges if ftype == "JPG" else [],
                     })
+            return {"exclude_ranges": exif_ranges}
         except Exception as e:
             self.log(f"Extraction failure for {ftype} @ {hex(start)}: {e}")
+            return {"exclude_ranges": []}
 
 if __name__ == "__main__":
     root = tk.Tk()
