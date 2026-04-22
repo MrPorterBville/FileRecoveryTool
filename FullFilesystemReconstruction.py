@@ -485,7 +485,9 @@ def main():
     parser.add_argument("--gui", action="store_true", help="Launch the desktop GUI.")
     args = parser.parse_args()
 
-    if args.gui:
+    # Default UX: launch GUI when no positional CLI parameters are provided.
+    # CLI mode is used when source/destination are passed explicitly.
+    if args.gui or (not args.source and not args.destination):
         root = tk.Tk()
         NTFSReconstructionGUI(root)
         root.mainloop()
