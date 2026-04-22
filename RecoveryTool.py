@@ -162,6 +162,7 @@ class UniversalRecoveryApp:
         alloc_filter = None
         skip_thumbnail_candidates = self.skip_exif_thumbs_var.get()
         jpg_exclusion_ranges = []
+        jpg_container_ranges = []
         self.recovery_report = []
         
         try:
@@ -215,6 +216,9 @@ class UniversalRecoveryApp:
                         if ftype == "JPG" and self.skip_exif_thumbs_var.get() and self._in_ranges(abs_start, jpg_exclusion_ranges):
                             self.log(f"Skipped JPG signature in EXIF thumbnail region @ {hex(abs_start)}.")
                             continue
+                        if ftype == "JPG" and self._in_ranges(abs_start, jpg_container_ranges):
+                            self.log(f"Skipped nested JPG signature inside previously recovered JPG @ {hex(abs_start)}.")
+                            continue
                         if alloc_filter and self._offset_is_allocated(abs_start, alloc_filter):
                             continue
                         processed_offsets.add(abs_start)
@@ -226,6 +230,10 @@ class UniversalRecoveryApp:
                         )
                         if ftype == "JPG" and extract_result and extract_result.get("exclude_ranges"):
                             jpg_exclusion_ranges.extend(extract_result["exclude_ranges"])
+                        if ftype == "JPG" and extract_result and extract_result.get("container_range"):
+                            cstart, cend = extract_result["container_range"]
+                            if cend > cstart:
+                                jpg_container_ranges.append((cstart, cend))
 
                     off = current_seek + CHUNK_SIZE - SCAN_OVERLAP
                 self.log("Pass 2/4 complete.")
