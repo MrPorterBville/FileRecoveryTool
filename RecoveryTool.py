@@ -160,6 +160,7 @@ class UniversalRecoveryApp:
                 self.log("Unallocated-only mode enabled: skipping signatures located in allocated clusters.")
             
             header_map = {CONFIG[t]['header']: t for t in active_types}
+            header_offsets = {t: (4 if t == "MP4" else 0) for t in active_types}
             pattern = re.compile(b'|'.join([re.escape(h) for h in header_map.keys()]))
 
             with open(src, "rb") as f:
@@ -179,8 +180,10 @@ class UniversalRecoveryApp:
                         found_idx = match.start()
                         header = match.group()
                         ftype = header_map.get(header)
-                        abs_start = current_seek + found_idx
-                        if not ftype or abs_start in processed_offsets:
+                        abs_start = current_seek + found_idx - header_offsets.get(ftype, 0)
+                        if abs_start < 0 or not ftype or abs_start in processed_offsets:
+                            continue
+                        if ftype == "MP4" and not self._looks_like_mp4_header_at(chunk, found_idx):
                             continue
                         if alloc_filter and self._offset_is_allocated(abs_start, alloc_filter):
                             continue
@@ -536,6 +539,41 @@ class UniversalRecoveryApp:
         conf = min(1.0, avg_score / max(1, blocks))
         return rec_len, stitched, False, trace, conf
 
+    def _looks_like_mp4_header_at(self, data, ftyp_index):
+        if ftyp_index < 4 or ftyp_index + 8 > len(data):
+            return False
+        size = int.from_bytes(data[ftyp_index - 4:ftyp_index], "big", signed=False)
+        if size < 8 or size > 128 * 1024 * 1024:
+            return False
+        brand = data[ftyp_index + 4:ftyp_index + 8]
+        return all(32 <= b <= 126 for b in brand)
+
+    def _parse_mp4_top_level(self, data):
+        boxes = []
+        pos = 0
+        total = len(data)
+        while pos + 8 <= total:
+            size = int.from_bytes(data[pos:pos + 4], "big", signed=False)
+            btype = data[pos + 4:pos + 8]
+            header_len = 8
+
+            if size == 1:
+                if pos + 16 > total:
+                    break
+                size = int.from_bytes(data[pos + 8:pos + 16], "big", signed=False)
+                header_len = 16
+            elif size == 0:
+                size = total - pos
+
+            if size < header_len or (pos + size) > total:
+                break
+            if not all(32 <= c <= 126 for c in btype):
+                break
+
+            boxes.append((pos, size, btype))
+            pos += size
+        return boxes, pos
+
     def _validate_jpeg(self, data):
         if not (data.startswith(b"\xFF\xD8") and data.endswith(b"\xFF\xD9")):
             return False
@@ -574,11 +612,19 @@ class UniversalRecoveryApp:
         return data.startswith(b"%PDF-") and (b"%%EOF" in data[-4096:]) and (b"xref" in data or b" obj" in data)
 
     def _validate_mp4(self, data):
-        if b"ftyp" not in data[:64]:
+        if len(data) < 16:
             return False
-        atoms = [b"moov", b"mdat", b"trak", b"mdia"]
-        hits = sum(1 for a in atoms if a in data)
-        return hits >= 2
+        ftyp_pos = data.find(b"ftyp")
+        if ftyp_pos != 4:
+            return False
+
+        boxes, parsed_len = self._parse_mp4_top_level(data)
+        if not boxes:
+            return False
+
+        box_types = [b for _, _, b in boxes]
+        has_media = (b"mdat" in box_types) and ((b"moov" in box_types) or (b"moof" in box_types))
+        return has_media and parsed_len >= max(1024, int(len(data) * 0.80))
 
     def _is_file_viable(self, path, ftype):
         try:
@@ -651,10 +697,15 @@ class UniversalRecoveryApp:
                     return False
             elif ftype == "MP4":
                 ftyp = repaired.find(b"ftyp")
-                if ftyp == -1:
+                if ftyp < 4:
                     return False
-                repaired = repaired[max(0, ftyp - 4):]
-                if b"moov" not in repaired and b"mdat" not in repaired:
+                repaired = repaired[ftyp - 4:]
+                boxes, parsed_len = self._parse_mp4_top_level(repaired)
+                if not boxes:
+                    return False
+                if parsed_len > 0 and parsed_len < len(repaired):
+                    repaired = repaired[:parsed_len]
+                if b"mdat" not in repaired or (b"moov" not in repaired and b"moof" not in repaired):
                     return False
             else:
                 return False
